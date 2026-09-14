@@ -1,0 +1,13 @@
+node_modules/
+.npm/
+.config.json
+.config.nodes.json
+.config.nodes.json.backup
+.sessions.json
+.flow-modbus-repeater.json.backup
+flow-modbus-repeater_cred.json
+*.backup
+npm-debug.log*
+.env
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+{
+  "name": "enlimit-modbus-repeater",
+  "version": "1.0.0",
+  "description": "Node-RED flow: Modbus Repeater",
+  "private": true,
+  "scripts": {
+    "start": "node-red -u . --settings settings.js"
+  },
+  "dependencies": {
+    "node-red": "^4.1.0",
+    "node-red-contrib-modbus": "^5.43.0"
+  }
+}
