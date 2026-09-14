@@ -1,0 +1,144 @@
+[
+    {
+        "id": "1076ddf93ad6d62d",
+        "type": "tab",
+        "label": "ModbusRepeater",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "8895ba48f47f9efb",
+        "type": "function",
+        "z": "1076ddf93ad6d62d",
+        "name": "modbus repeater v3",
+        "func": "\nreturn msg;",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "// ==== Instellingen ====\nconst LISTEN_HOST = '0.0.0.0';\nconst LISTEN_PORT = 1502;\nconst TARGET_HOST = '172.19.211.243';\nconst TARGET_PORT = 502;\n\n//const CLOSE_TARGET_AFTER_REQUEST = false; // true = korte verbinding per Modbus-call, false = blijvende verbinding\nconst CLOSE_TARGET_AFTER_REQUEST = true; // true = korte verbinding per Modbus-call, false = blijvende verbinding\nconst REQUEST_TIMEOUT_MS = 3000;          // alleen relevant bij CLOSE_TARGET_AFTER_REQUEST=true\n\nconst RETRY_DELAY_MS = 5000;              // wachttijd voor herstart-poging bij server-fout\nconst WATCHDOG_INTERVAL_MS = 30000;       // periodieke health-check\n\n// ==== Helpers ====\nfunction hex(buf) {\n    return buf.toString('hex').match(/.{1,2}/g).join(' ');\n}\n\nfunction parseMbap(buf) {\n    if (buf.length < 8) return { error: 'buffer te kort voor MBAP header (' + buf.length + ' bytes)' };\n    return {\n        transactionId: buf.readUInt16BE(0),\n        protocolId: buf.readUInt16BE(2),\n        length: buf.readUInt16BE(4),\n        unitId: buf.readUInt8(6),\n        functionCode: buf.readUInt8(7),\n        exception: (buf.readUInt8(7) & 0x80) !== 0\n    };\n}\n\n// Verwachte totale framelengte o.b.v. MBAP length-veld (6 header-bytes + length-waarde)\nfunction expectedFrameLength(buf) {\n    if (buf.length < 6) return null;\n    return 6 + buf.readUInt16BE(4);\n}\n\nfunction closeSocket(sock) {\n    if (!sock) return;\n    try {\n        if (typeof sock.destroy === 'function') sock.destroy();\n        else if (typeof sock.end === 'function') sock.end();\n    } catch (e) {\n        node.warn('Kon socket niet sluiten: ' + e.message);\n    }\n}\n\nfunction sendStatus(level, message, extra) {\n    // level: 'info' | 'warn' | 'error'\n    const statusMsg = { topic: 'repeater-status', payload: Object.assign({ level: level, message: message, time: new Date().toISOString() }, extra || {}) };\n    node.send([null, statusMsg]); // output 2\n    if (level === 'error') { node.error(message); node.status({ fill: 'red', shape: 'ring', text: message }); }\n    else if (level === 'warn') { node.warn(message); node.status({ fill: 'yellow', shape: 'ring', text: message }); }\n    else { node.warn(message); node.status({ fill: 'green', shape: 'dot', text: message }); }\n}\n\n// ==== Server-opbouw ====\nfunction startServer() {\n    let server;\n    try {\n        server = net.createServer((clientSocket) => {\n            const clientAddr = clientSocket.remoteAddress + ':' + clientSocket.remotePort;\n            sendStatus('info', 'Management verbonden: ' + clientAddr);\n\n            if (!CLOSE_TARGET_AFTER_REQUEST) {\n                // ---- Persistente modus: één blijvende targetSocket voor de hele clientsessie ----\n                const targetSocket = new net.Socket();\n\n                targetSocket.on('error', (e) => {\n                    sendStatus('error', 'Target error: ' + e.message, { clientAddr: clientAddr, target: TARGET_HOST + ':' + TARGET_PORT });\n                    closeSocket(clientSocket);\n                });\n\n                targetSocket.connect(TARGET_PORT, TARGET_HOST, () => {\n                    sendStatus('info', 'Verbonden met slave ' + TARGET_HOST + ':' + TARGET_PORT);\n                });\n\n                clientSocket.on('data', (data) => {\n                    try {\n                        const mbap = parseMbap(data);\n                        node.send([{ topic: 'mgmt->slave', payload: data, raw: hex(data), mbap: mbap }, null]);\n                        if (!targetSocket.destroyed) targetSocket.write(data);\n                    } catch (e) {\n                        sendStatus('error', 'Fout bij verwerken mgmt->slave: ' + e.message);\n                    }\n                });\n\n                targetSocket.on('data', (data) => {\n                    try {\n                        const mbap = parseMbap(data);\n                        node.send([{ topic: 'slave->mgmt', payload: data, raw: hex(data), mbap: mbap }, null]);\n                        if (!clientSocket.destroyed) clientSocket.write(data);\n                    } catch (e) {\n                        sendStatus('error', 'Fout bij verwerken slave->mgmt: ' + e.message);\n                    }\n                });\n\n                clientSocket.on('close', () => { sendStatus('info', 'Management gesloten: ' + clientAddr); closeSocket(targetSocket); });\n                targetSocket.on('close', () => closeSocket(clientSocket));\n                clientSocket.on('error', (e) => { sendStatus('error', 'Client error: ' + e.message, { clientAddr: clientAddr }); closeSocket(targetSocket); });\n\n            } else {\n                // ---- Per-request modus: nieuwe, korte targetSocket per Modbus-call ----\n                let requestQueue = Promise.resolve(); // voorkomt overlappende requests door elkaar\n\n                clientSocket.on('data', (requestData) => {\n                    const mbapReq = parseMbap(requestData);\n                    node.send([{ topic: 'mgmt->slave', payload: requestData, raw: hex(requestData), mbap: mbapReq }, null]);\n\n                    requestQueue = requestQueue.then(() => new Promise((resolve) => {\n                        const targetSocket = new net.Socket();\n                        let responseBuf = Buffer.alloc(0);\n                        let settled = false;\n\n                        const finish = () => {\n                            if (settled) return;\n                            settled = true;\n                            clearTimeout(timeoutHandle);\n                            closeSocket(targetSocket);\n                            resolve();\n                        };\n\n                        const timeoutHandle = setTimeout(() => {\n                            sendStatus('warn', 'Timeout op antwoord van slave (per-request modus)', { clientAddr: clientAddr });\n                            finish();\n                        }, REQUEST_TIMEOUT_MS);\n\n                        targetSocket.on('error', (e) => {\n                            sendStatus('error', 'Target error (per-request): ' + e.message, { clientAddr: clientAddr, target: TARGET_HOST + ':' + TARGET_PORT });\n                            finish();\n                        });\n\n                        targetSocket.connect(TARGET_PORT, TARGET_HOST, () => {\n                            targetSocket.write(requestData);\n                        });\n\n                        targetSocket.on('data', (chunk) => {\n                            responseBuf = Buffer.concat([responseBuf, chunk]);\n                            const expected = expectedFrameLength(responseBuf);\n                            if (expected !== null && responseBuf.length >= expected) {\n                                const mbapResp = parseMbap(responseBuf);\n                                node.send([{ topic: 'slave->mgmt', payload: responseBuf, raw: hex(responseBuf), mbap: mbapResp }, null]);\n                                if (!clientSocket.destroyed) clientSocket.write(responseBuf);\n                                finish();\n                            }\n                        });\n                    }));\n                });\n\n                clientSocket.on('close', () => sendStatus('info', 'Management gesloten: ' + clientAddr));\n                clientSocket.on('error', (e) => sendStatus('error', 'Client error: ' + e.message, { clientAddr: clientAddr }));\n            }\n        });\n\n        server.on('error', (e) => {\n            sendStatus('error', 'Server error: ' + e.message + ' — herstart over ' + (RETRY_DELAY_MS / 1000) + 's');\n            try { server.close(); } catch (err) { /* al dicht, negeer */ }\n            const t = setTimeout(startServer, RETRY_DELAY_MS);\n            context.set('restartTimer', t);\n        });\n\n        server.listen(LISTEN_PORT, LISTEN_HOST, () => {\n            sendStatus('info', 'Repeater luistert op ' + LISTEN_HOST + ':' + LISTEN_PORT + ' (modus: ' + (CLOSE_TARGET_AFTER_REQUEST ? 'per-request' : 'persistent') + ')');\n        });\n\n        context.set('server', server);\n    } catch (e) {\n        sendStatus('error', 'Kon server niet starten: ' + e.message + ' — herstart over ' + (RETRY_DELAY_MS / 1000) + 's');\n        const t = setTimeout(startServer, RETRY_DELAY_MS);\n        context.set('restartTimer', t);\n    }\n}\n\nstartServer();\n\n// ==== Watchdog: periodieke health-check of de server daadwerkelijk nog luistert ====\nconst watchdog = setInterval(() => {\n    const server = context.get('server');\n    if (!server || !server.listening) {\n        sendStatus('warn', 'Watchdog: server luistert niet meer, herstart wordt gestart');\n        startServer();\n    }\n}, WATCHDOG_INTERVAL_MS);\ncontext.set('watchdog', watchdog);",
+        "finalize": "const server = context.get('server');\nconst watchdog = context.get('watchdog');\nconst restartTimer = context.get('restartTimer');\n\nif (watchdog) clearInterval(watchdog);\nif (restartTimer) clearTimeout(restartTimer);\nif (server) server.close();\n\n",
+        "libs": [
+            {
+                "var": "net",
+                "module": "net"
+            }
+        ],
+        "x": 840,
+        "y": 280,
+        "wires": [
+            [
+                "ccc0a1d516502b9c"
+            ],
+            [
+                "73d3757d70daddd9",
+                "bdb0adb2b8aa7290"
+            ]
+        ]
+    },
+    {
+        "id": "ccc0a1d516502b9c",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Modbus dbg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1470,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "73d3757d70daddd9",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Server Status msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1470,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "bfcb167da95dca9b",
+        "type": "catch",
+        "z": "1076ddf93ad6d62d",
+        "name": "",
+        "scope": [
+            "8895ba48f47f9efb"
+        ],
+        "uncaught": false,
+        "x": 1170,
+        "y": 500,
+        "wires": [
+            [
+                "969c229178f8811a"
+            ]
+        ]
+    },
+    {
+        "id": "969c229178f8811a",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Flow Error msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1460,
+        "y": 500,
+        "wires": []
+    },
+    {
+        "id": "bdb0adb2b8aa7290",
+        "type": "function",
+        "z": "1076ddf93ad6d62d",
+        "name": "Repeater Errors",
+        "func": "// ==== Instellingen ====\nconst MIN_LEVEL = 'error';           // 'warn' of 'error' — alles daaronder wordt genegeerd\nconst DEBOUNCE_MS = 60000;           // minimaal deze tijd tussen twee alerts van hetzelfde type\nconst IGNORE_MESSAGES_CONTAINING = [ // ruis die je nooit als \"echte fout\" wilt zien, ook al is het level 'error'\n    // voorbeeld: 'ECONNRESET'  -- laat leeg als je alles wilt zien\n];\n\nconst levelRank = { info: 0, warn: 1, error: 2 };\n\nif (!msg.payload || typeof msg.payload !== 'object') {\n    return null; // onverwacht formaat, negeer stilletjes\n}\n\nconst { level, message } = msg.payload;\n\n// Stap 1: level-filter\nif (levelRank[level] === undefined || levelRank[level] < levelRank[MIN_LEVEL]) {\n    return null;\n}\n\n// Stap 2: bekende ruis eruit filteren\nif (IGNORE_MESSAGES_CONTAINING.some(needle => message.includes(needle))) {\n    return null;\n}\n\n// Stap 3: debounce — voorkom alert-spam bij herhaalde identieke fouten\n// Sleutel op basis van message-tekst (zonder tijdstip/adres-specifieke details te hard te binden)\nconst dedupeKey = message.replace(/\\d/g, '#'); // cijfers weg zodat bv. poortnummers niet elke keer een 'nieuwe' fout lijken\nconst lastSeen = context.get('lastSeen') || {};\nconst now = Date.now();\n\nif (lastSeen[dedupeKey] && (now - lastSeen[dedupeKey]) < DEBOUNCE_MS) {\n    // Zelfde soort fout te snel opnieuw — onderdruk, maar hou een teller bij\n    const suppressedCount = context.get('suppressedCount') || {};\n    suppressedCount[dedupeKey] = (suppressedCount[dedupeKey] || 0) + 1;\n    context.set('suppressedCount', suppressedCount);\n    return null;\n}\n\nlastSeen[dedupeKey] = now;\ncontext.set('lastSeen', lastSeen);\n\n// Stap 4: als er eerder onderdrukte meldingen waren, vermeld dat erbij\nconst suppressedCount = context.get('suppressedCount') || {};\nconst suppressedForThis = suppressedCount[dedupeKey] || 0;\nif (suppressedForThis > 0) {\n    msg.payload.suppressedRepeats = suppressedForThis;\n    suppressedCount[dedupeKey] = 0;\n    context.set('suppressedCount', suppressedCount);\n}\n\n// Stap 5: doorlaten als échte, relevante fout\nmsg.topic = 'MODBUS REPEATER ALERT';\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1460,
+        "y": 340,
+        "wires": [
+            [
+                "d9b81d509f6d269e"
+            ]
+        ]
+    },
+    {
+        "id": "d9b81d509f6d269e",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Server Status msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1690,
+        "y": 300,
+        "wires": []
+    }
+]
