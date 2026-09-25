@@ -1,0 +1,144 @@
+[
+    {
+        "id": "1076ddf93ad6d62d",
+        "type": "tab",
+        "label": "ModbusRepeater",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "8895ba48f47f9efb",
+        "type": "function",
+        "z": "1076ddf93ad6d62d",
+        "name": "modbus repeater v3.4",
+        "func": "\nreturn msg;",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "// ==== Instellingen (v3.4) ====\n// Optioneel overschrijven via Node-RED env:\n//   MODBUS_LISTEN_HOST, MODBUS_LISTEN_PORT, MODBUS_TARGET_HOST, MODBUS_TARGET_PORT\n/**\n * @param {string} name\n * @param {string} fallback\n * @returns {string}\n */\nfunction envStr(name, fallback) {\n    try {\n        if (typeof env !== 'undefined' && typeof env.get === 'function') {\n            const v = env.get(name);\n            if (v !== undefined && v !== null && String(v) !== '') return String(v);\n        }\n    } catch (e) { /* geen env-context */ }\n    return fallback;\n}\n\n/**\n * @param {string} name\n * @param {number} fallback\n * @returns {number}\n */\nfunction envInt(name, fallback) {\n    const v = parseInt(envStr(name, String(fallback)), 10);\n    return Number.isFinite(v) ? v : fallback;\n}\n\nconst LISTEN_HOST = envStr('MODBUS_LISTEN_HOST', '0.0.0.0');\nconst LISTEN_PORT = envInt('MODBUS_LISTEN_PORT', 1502);\nconst TARGET_HOST = envStr('MODBUS_TARGET_HOST', '172.19.211.243');\nconst TARGET_PORT = envInt('MODBUS_TARGET_PORT', 502);\n\nconst CLOSE_TARGET_AFTER_REQUEST = true; // true = korte verbinding per call, false = persistente sessie\n\nconst REQUEST_TIMEOUT_MS = 3000;\nconst CONNECT_TIMEOUT_MS = 3000;\nconst RETRY_DELAY_MS = 5000;\nconst WATCHDOG_INTERVAL_MS = 30000;\n\nconst MAX_ADU_LENGTH = 260;   // Modbus TCP ADU-maximum\nconst MIN_LENGTH_FIELD = 2;   // unit id + function code\nconst MAX_CONNECTIONS = 8;    // gelijktijdige management-clients\nconst MAX_QUEUE_DEPTH = 2;    // in-flight + wachtend per management-client\nconst DEBUG_PAYLOADS = false; // true = volledige hex naar output 1\n\n// Leeg = alle clients. Zet hier management-IP's om de repeater af te schermen.\nconst ALLOWED_CLIENT_IPS = [\n    // '10.0.0.20',\n];\n\nconst STATES = { IDLE: 'idle', STARTING: 'starting', LISTENING: 'listening', RESTARTING: 'restarting' };\n\n/**\n * @typedef {Object} MbapParse\n * @property {string} [error]\n * @property {number} [transactionId]\n * @property {number} [protocolId]\n * @property {number} [length]\n * @property {number} [unitId]\n * @property {number} [functionCode]\n * @property {boolean} [exception]\n */\n\n/**\n * @param {unknown} e\n * @returns {string}\n */\nfunction errMsg(e) {\n    return e instanceof Error ? e.message : String(e);\n}\n\n// ==== Helpers ====\n/**\n * @param {Buffer} buf\n * @returns {string}\n */\nfunction hex(buf) {\n    if (!buf || buf.length === 0) return '';\n    const parts = buf.toString('hex').match(/.{1,2}/g);\n    return parts ? parts.join(' ') : '';\n}\n\n/**\n * @param {import('net').Socket} sock\n * @param {Buffer} buf\n */\nfunction writeBuf(sock, buf) {\n    if (!sock || sock.destroyed) return;\n    sock.write(Uint8Array.from(buf));\n}\n\n/**\n * @param {Buffer} buf\n * @returns {MbapParse}\n */\nfunction parseMbap(buf) {\n    if (buf.length < 8) return { error: 'buffer te kort voor MBAP header (' + buf.length + ' bytes)' };\n    return {\n        transactionId: buf.readUInt16BE(0),\n        protocolId: buf.readUInt16BE(2),\n        length: buf.readUInt16BE(4),\n        unitId: buf.readUInt8(6),\n        functionCode: buf.readUInt8(7),\n        exception: (buf.readUInt8(7) & 0x80) !== 0\n    };\n}\n\n/**\n * @param {string | null | undefined} addr\n * @returns {string}\n */\nfunction normalizeIp(addr) {\n    if (!addr) return '';\n    if (addr.indexOf('::ffff:') === 0) return addr.slice(7);\n    return addr;\n}\n\n/**\n * @param {import('net').Socket} sock\n * @returns {boolean}\n */\nfunction isClientAllowed(sock) {\n    if (!ALLOWED_CLIENT_IPS.length) return true;\n    return ALLOWED_CLIENT_IPS.indexOf(normalizeIp(sock.remoteAddress)) !== -1;\n}\n\n/**\n * @param {import('net').Socket | null | undefined} sock\n */\nfunction closeSocket(sock) {\n    if (!sock) return;\n    try {\n        if (typeof sock.destroy === 'function') sock.destroy();\n        else if (typeof sock.end === 'function') sock.end();\n    } catch (e) {\n        node.warn('Kon socket niet sluiten: ' + errMsg(e));\n    }\n}\n\n/** @returns {Set<import('net').Socket>} */\nfunction getSocketSet() {\n    /** @type {Set<import('net').Socket> | undefined} */\n    let set = context.get('sockets');\n    if (!set || typeof set.add !== 'function') {\n        set = new Set();\n        context.set('sockets', set);\n    }\n    return set;\n}\n\n/**\n * @param {import('net').Socket | null | undefined} sock\n */\nfunction trackSocket(sock) {\n    if (!sock) return;\n    const sockets = getSocketSet();\n    sockets.add(sock);\n    sock.once('close', function () { sockets.delete(sock); });\n}\n\n/**\n * @param {import('net').Socket} sock\n */\nfunction hardenSocket(sock) {\n    try {\n        sock.setNoDelay(true);\n        sock.setKeepAlive(true, 10000);\n    } catch (e) { /* ignore */ }\n    trackSocket(sock);\n}\n\nfunction snapshotAndDestroySockets() {\n    const sockets = getSocketSet();\n    /** @type {import('net').Socket[]} */\n    const snapshot = [];\n    sockets.forEach(function (sock) { snapshot.push(sock); });\n    sockets.clear();\n    snapshot.forEach(closeSocket);\n}\n\nfunction clearRestartTimer() {\n    const t = context.get('restartTimer');\n    if (t) clearTimeout(t);\n    context.set('restartTimer', null);\n}\n\n/**\n * @param {'info' | 'warn' | 'error'} level\n * @param {string} message\n * @param {Record<string, unknown>} [extra]\n */\nfunction sendStatus(level, message, extra) {\n    const statusMsg = {\n        topic: 'repeater-status',\n        payload: Object.assign({ level: level, message: message, time: new Date().toISOString() }, extra || {})\n    };\n    node.send([null, statusMsg]);\n    const short = message.length > 80 ? message.slice(0, 77) + '...' : message;\n    if (level === 'error') {\n        node.error(message);\n        node.status({ fill: 'red', shape: 'ring', text: short });\n    } else if (level === 'warn') {\n        node.warn(message);\n        node.status({ fill: 'yellow', shape: 'ring', text: short });\n    } else {\n        node.status({ fill: 'green', shape: 'dot', text: short });\n    }\n}\n\n/**\n * @param {string} topic\n * @param {Buffer} frame\n */\nfunction emitTraffic(topic, frame) {\n    const mbap = parseMbap(frame);\n    const out = { topic: topic, mbap: mbap, payload: undefined, raw: undefined };\n    if (DEBUG_PAYLOADS) {\n        out.payload = frame;\n        out.raw = hex(frame);\n    } else {\n        out.payload = {\n            bytes: frame.length,\n            transactionId: mbap.transactionId,\n            unitId: mbap.unitId,\n            functionCode: mbap.functionCode,\n            exception: mbap.exception\n        };\n    }\n    node.send([out, null]);\n}\n\n/**\n * @param {(frame: Buffer) => void} onFrame\n * @param {(err: string) => void} onError\n */\nfunction createFramer(onFrame, onError) {\n    let buf = Buffer.alloc(0);\n    return {\n        /**\n         * @param {Buffer} chunk\n         */\n        push: function (chunk) {\n            if (!chunk || chunk.length === 0) return;\n            buf = Buffer.concat([buf, chunk]);\n            while (true) {\n                if (buf.length < 6) return;\n                const lengthField = buf.readUInt16BE(4);\n                const frameLen = 6 + lengthField;\n                if (lengthField < MIN_LENGTH_FIELD || frameLen > MAX_ADU_LENGTH) {\n                    buf = Buffer.alloc(0);\n                    onError('ongeldige MBAP length ' + lengthField + ' (max ADU ' + MAX_ADU_LENGTH + ')');\n                    return;\n                }\n                if (buf.length < frameLen) return;\n                const frame = Buffer.from(buf.subarray(0, frameLen));\n                buf = Buffer.from(buf.subarray(frameLen));\n                const protocolId = frame.readUInt16BE(2);\n                if (protocolId !== 0) {\n                    buf = Buffer.alloc(0);\n                    onError('ongeldige protocolId ' + protocolId);\n                    return;\n                }\n                onFrame(frame);\n            }\n        }\n    };\n}\n\n/**\n * @param {import('net').Server | null | undefined} server\n */\nfunction closeServer(server) {\n    if (!server) return;\n    try {\n        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();\n    } catch (e) { /* ignore */ }\n    try { server.close(); } catch (e) { /* ignore */ }\n}\n\n/**\n * @param {string} state\n */\nfunction setState(state) {\n    context.set('serverState', state);\n}\n\n/** @returns {string} */\nfunction getState() {\n    return context.get('serverState') || STATES.IDLE;\n}\n\n/**\n * @template T\n * @param {() => (T | Promise<T>)} fn\n * @returns {Promise<T>}\n */\nfunction withTargetSlot(fn) {\n    let gate = context.get('targetGate');\n    if (!gate || typeof gate.then !== 'function') gate = Promise.resolve();\n    const run = gate.then(fn, fn);\n    context.set('targetGate', run.then(function () { /* slot vrij */ }, function () { /* slot vrij na fout */ }));\n    return run;\n}\n\n/**\n * @param {string} reason\n */\nfunction scheduleRestart(reason) {\n    if (getState() === STATES.RESTARTING) return;\n    setState(STATES.RESTARTING);\n    sendStatus('error', reason + ' — herstart over ' + (RETRY_DELAY_MS / 1000) + 's');\n    snapshotAndDestroySockets();\n    closeServer(context.get('server'));\n    context.set('server', null);\n    clearRestartTimer();\n    const t = setTimeout(function () {\n        setState(STATES.IDLE);\n        startServer();\n    }, RETRY_DELAY_MS);\n    context.set('restartTimer', t);\n}\n\n/**\n * @param {import('net').Socket} clientSocket\n */\nfunction attachClient(clientSocket) {\n    const clientAddr = normalizeIp(clientSocket.remoteAddress) + ':' + clientSocket.remotePort;\n    hardenSocket(clientSocket);\n\n    if (!isClientAllowed(clientSocket)) {\n        sendStatus('warn', 'Verbinding geweigerd (niet op allowlist): ' + clientAddr);\n        closeSocket(clientSocket);\n        return;\n    }\n\n    sendStatus('info', 'Management verbonden: ' + clientAddr);\n\n    if (!CLOSE_TARGET_AFTER_REQUEST) {\n        attachPersistent(clientSocket, clientAddr);\n    } else {\n        attachPerRequest(clientSocket, clientAddr);\n    }\n}\n\n/**\n * @param {import('net').Socket} clientSocket\n * @param {string} clientAddr\n */\nfunction attachPersistent(clientSocket, clientAddr) {\n    const targetSocket = new net.Socket();\n    hardenSocket(targetSocket);\n    let targetReady = false;\n    /** @type {Buffer[]} */\n    const pending = [];\n    let sessionClosed = false;\n\n    function tearDown() {\n        if (sessionClosed) return;\n        sessionClosed = true;\n        closeSocket(targetSocket);\n        closeSocket(clientSocket);\n    }\n\n    const connectTimer = setTimeout(function () {\n        if (!targetReady) {\n            sendStatus('warn', 'Connect-timeout naar slave', { clientAddr: clientAddr, target: TARGET_HOST + ':' + TARGET_PORT });\n            tearDown();\n        }\n    }, CONNECT_TIMEOUT_MS);\n\n    targetSocket.on('error', function (e) {\n        sendStatus('error', 'Target error: ' + errMsg(e), { clientAddr: clientAddr, target: TARGET_HOST + ':' + TARGET_PORT });\n        tearDown();\n    });\n\n    targetSocket.connect(TARGET_PORT, TARGET_HOST, function () {\n        clearTimeout(connectTimer);\n        if (sessionClosed) return;\n        targetReady = true;\n        sendStatus('info', 'Verbonden met slave ' + TARGET_HOST + ':' + TARGET_PORT);\n        for (let i = 0; i < pending.length; i++) {\n            writeBuf(targetSocket, pending[i]);\n        }\n        pending.length = 0;\n    });\n\n    const clientFramer = createFramer(\n        function (frame) {\n            emitTraffic('mgmt->slave', frame);\n            if (sessionClosed) return;\n            if (targetReady) writeBuf(targetSocket, frame);\n            else if (pending.length < MAX_QUEUE_DEPTH) pending.push(frame);\n            else {\n                sendStatus('warn', 'Pending-buffer vol vóór slave-connect, sessie gesloten', { clientAddr: clientAddr });\n                tearDown();\n            }\n        },\n        function (err) {\n            sendStatus('error', 'Framing-fout mgmt->slave: ' + err, { clientAddr: clientAddr });\n            tearDown();\n        }\n    );\n\n    const slaveFramer = createFramer(\n        function (frame) {\n            emitTraffic('slave->mgmt', frame);\n            writeBuf(clientSocket, frame);\n        },\n        function (err) {\n            sendStatus('error', 'Framing-fout slave->mgmt: ' + err, { clientAddr: clientAddr });\n            tearDown();\n        }\n    );\n\n    clientSocket.on('data', function (data) { clientFramer.push(data); });\n    targetSocket.on('data', function (data) { slaveFramer.push(data); });\n    clientSocket.on('close', function () {\n        sendStatus('info', 'Management gesloten: ' + clientAddr);\n        tearDown();\n    });\n    targetSocket.on('close', function () { tearDown(); });\n    clientSocket.on('error', function (e) {\n        sendStatus('error', 'Client error: ' + errMsg(e), { clientAddr: clientAddr });\n        tearDown();\n    });\n}\n\n/**\n * @param {import('net').Socket} clientSocket\n * @param {string} clientAddr\n */\nfunction attachPerRequest(clientSocket, clientAddr) {\n    let requestQueue = Promise.resolve();\n    let queueDepth = 0;\n    let aborted = false;\n    /** @type {import('net').Socket[]} */\n    const inflight = [];\n\n    function abortSession() {\n        aborted = true;\n        const open = inflight.slice();\n        inflight.length = 0;\n        open.forEach(closeSocket);\n    }\n\n    /**\n     * @param {Buffer} frame\n     */\n    function runRequest(frame) {\n        return withTargetSlot(function () {\n            return new Promise(function (resolve) {\n                if (aborted || clientSocket.destroyed) {\n                    resolve();\n                    return;\n                }\n\n                emitTraffic('mgmt->slave', frame);\n\n                const targetSocket = new net.Socket();\n                hardenSocket(targetSocket);\n                inflight.push(targetSocket);\n                let settled = false;\n                let wrote = false;\n\n                const finish = function () {\n                    if (settled) return;\n                    settled = true;\n                    clearTimeout(timeoutHandle);\n                    const idx = inflight.indexOf(targetSocket);\n                    if (idx !== -1) inflight.splice(idx, 1);\n                    closeSocket(targetSocket);\n                    resolve();\n                };\n\n                const timeoutHandle = setTimeout(function () {\n                    sendStatus('warn', wrote\n                        ? 'Timeout op antwoord van slave (per-request modus)'\n                        : 'Connect-timeout naar slave (per-request modus)', {\n                        clientAddr: clientAddr,\n                        target: TARGET_HOST + ':' + TARGET_PORT\n                    });\n                    finish();\n                }, REQUEST_TIMEOUT_MS);\n\n                targetSocket.on('error', function (e) {\n                    sendStatus('error', 'Target error (per-request): ' + errMsg(e), { clientAddr: clientAddr, target: TARGET_HOST + ':' + TARGET_PORT });\n                    finish();\n                });\n\n                const respFramer = createFramer(\n                    function (respFrame) {\n                        emitTraffic('slave->mgmt', respFrame);\n                        if (!aborted) writeBuf(clientSocket, respFrame);\n                        finish();\n                    },\n                    function (err) {\n                        sendStatus('error', 'Framing-fout slave->mgmt: ' + err, { clientAddr: clientAddr });\n                        finish();\n                    }\n                );\n\n                targetSocket.on('data', function (chunk) { respFramer.push(chunk); });\n\n                targetSocket.on('close', function () {\n                    if (!settled) {\n                        sendStatus('warn', 'Slave sloot verbinding vóór een volledig frame', { clientAddr: clientAddr });\n                    }\n                    finish();\n                });\n\n                targetSocket.connect(TARGET_PORT, TARGET_HOST, function () {\n                    if (settled || aborted) {\n                        closeSocket(targetSocket);\n                        return;\n                    }\n                    wrote = true;\n                    writeBuf(targetSocket, frame);\n                });\n            });\n        });\n    }\n\n    const clientFramer = createFramer(\n        function (frame) {\n            if (aborted || clientSocket.destroyed) return;\n            if (queueDepth >= MAX_QUEUE_DEPTH) {\n                sendStatus('warn', 'Queue vol (' + MAX_QUEUE_DEPTH + '), sessie gesloten', { clientAddr: clientAddr });\n                closeSocket(clientSocket);\n                abortSession();\n                return;\n            }\n            queueDepth += 1;\n            requestQueue = requestQueue\n                .then(function () { return runRequest(frame); })\n                .catch(function (e) {\n                    sendStatus('error', 'Request-fout: ' + errMsg(e), { clientAddr: clientAddr });\n                })\n                .then(function () { queueDepth -= 1; });\n        },\n        function (err) {\n            sendStatus('error', 'Framing-fout mgmt->slave: ' + err, { clientAddr: clientAddr });\n            closeSocket(clientSocket);\n            abortSession();\n        }\n    );\n\n    clientSocket.on('data', function (data) { clientFramer.push(data); });\n    clientSocket.on('close', function () {\n        abortSession();\n        sendStatus('info', 'Management gesloten: ' + clientAddr);\n    });\n    clientSocket.on('error', function (e) {\n        abortSession();\n        sendStatus('error', 'Client error: ' + errMsg(e), { clientAddr: clientAddr });\n    });\n}\n\nfunction startServer() {\n    const state = getState();\n    if (state === STATES.STARTING || state === STATES.LISTENING || state === STATES.RESTARTING) {\n        return;\n    }\n\n    setState(STATES.STARTING);\n    clearRestartTimer();\n\n    const previous = context.get('server');\n    if (previous) {\n        closeServer(previous);\n        context.set('server', null);\n    }\n\n    try {\n        const server = net.createServer(attachClient);\n        server.maxConnections = MAX_CONNECTIONS;\n\n        server.on('error', function (e) {\n            scheduleRestart('Server error: ' + errMsg(e));\n        });\n\n        server.listen(LISTEN_PORT, LISTEN_HOST, function () {\n            setState(STATES.LISTENING);\n            const mode = CLOSE_TARGET_AFTER_REQUEST ? 'per-request' : 'persistent';\n            const acl = ALLOWED_CLIENT_IPS.length ? ('allowlist ' + ALLOWED_CLIENT_IPS.length + ' IP') : 'geen IP-allowlist';\n            sendStatus('info', 'Repeater v3.4 luistert op ' + LISTEN_HOST + ':' + LISTEN_PORT + ' (modus: ' + mode + ', maxConn: ' + MAX_CONNECTIONS + ', ' + acl + ')');\n        });\n\n        context.set('server', server);\n    } catch (e) {\n        context.set('server', null);\n        setState(STATES.IDLE);\n        scheduleRestart('Kon server niet starten: ' + errMsg(e));\n    }\n}\n\nstartServer();\n\nconst watchdog = setInterval(function () {\n    const state = getState();\n    if (state === STATES.STARTING || state === STATES.RESTARTING) return;\n    const server = context.get('server');\n    if (!server || !server.listening) {\n        sendStatus('warn', 'Watchdog: server luistert niet meer, herstart wordt gestart');\n        setState(STATES.IDLE);\n        startServer();\n    }\n}, WATCHDOG_INTERVAL_MS);\ncontext.set('watchdog', watchdog);\n",
+        "finalize": "const watchdog = context.get('watchdog');\nconst restartTimer = context.get('restartTimer');\nconst server = context.get('server');\nconst sockets = context.get('sockets');\n\nif (watchdog) clearInterval(watchdog);\nif (restartTimer) clearTimeout(restartTimer);\n\nif (sockets && typeof sockets.forEach === 'function') {\n    const snapshot = [];\n    sockets.forEach(function (sock) { snapshot.push(sock); });\n    sockets.clear();\n    snapshot.forEach(function (sock) {\n        try {\n            if (sock && typeof sock.destroy === 'function') sock.destroy();\n        } catch (e) { /* ignore */ }\n    });\n}\n\nif (server) {\n    try {\n        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();\n    } catch (e) { /* ignore */ }\n    try { server.close(); } catch (e) { /* ignore */ }\n}\n\ncontext.set('server', null);\ncontext.set('watchdog', null);\ncontext.set('restartTimer', null);\ncontext.set('sockets', null);\ncontext.set('targetGate', null);\ncontext.set('serverState', 'idle');\n",
+        "libs": [
+            {
+                "var": "net",
+                "module": "net"
+            }
+        ],
+        "x": 840,
+        "y": 280,
+        "wires": [
+            [
+                "ccc0a1d516502b9c"
+            ],
+            [
+                "73d3757d70daddd9",
+                "bdb0adb2b8aa7290"
+            ]
+        ]
+    },
+    {
+        "id": "ccc0a1d516502b9c",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Modbus dbg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1470,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "73d3757d70daddd9",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Server Status msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1470,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "bfcb167da95dca9b",
+        "type": "catch",
+        "z": "1076ddf93ad6d62d",
+        "name": "",
+        "scope": [
+            "8895ba48f47f9efb"
+        ],
+        "uncaught": false,
+        "x": 1170,
+        "y": 500,
+        "wires": [
+            [
+                "969c229178f8811a"
+            ]
+        ]
+    },
+    {
+        "id": "969c229178f8811a",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Flow Error msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1460,
+        "y": 500,
+        "wires": []
+    },
+    {
+        "id": "bdb0adb2b8aa7290",
+        "type": "function",
+        "z": "1076ddf93ad6d62d",
+        "name": "Repeater Errors",
+        "func": "// ==== Instellingen ====\nconst MIN_LEVEL = 'error';           // 'warn' of 'error' — alles daaronder wordt genegeerd\nconst DEBOUNCE_MS = 60000;           // minimaal deze tijd tussen twee alerts van hetzelfde type\nconst IGNORE_MESSAGES_CONTAINING = [ // ruis die je nooit als \"echte fout\" wilt zien, ook al is het level 'error'\n    // voorbeeld: 'ECONNRESET'  -- laat leeg als je alles wilt zien\n];\n\nconst levelRank = { info: 0, warn: 1, error: 2 };\n\nif (!msg.payload || typeof msg.payload !== 'object') {\n    return null; // onverwacht formaat, negeer stilletjes\n}\n\nconst { level, message } = msg.payload;\n\n// Stap 1: level-filter\nif (levelRank[level] === undefined || levelRank[level] < levelRank[MIN_LEVEL]) {\n    return null;\n}\n\n// Stap 2: bekende ruis eruit filteren\nif (IGNORE_MESSAGES_CONTAINING.some(needle => message.includes(needle))) {\n    return null;\n}\n\n// Stap 3: debounce — voorkom alert-spam bij herhaalde identieke fouten\n// Sleutel op basis van message-tekst (zonder tijdstip/adres-specifieke details te hard te binden)\nconst dedupeKey = message.replace(/\\d/g, '#'); // cijfers weg zodat bv. poortnummers niet elke keer een 'nieuwe' fout lijken\nconst lastSeen = context.get('lastSeen') || {};\nconst now = Date.now();\n\nif (lastSeen[dedupeKey] && (now - lastSeen[dedupeKey]) < DEBOUNCE_MS) {\n    // Zelfde soort fout te snel opnieuw — onderdruk, maar hou een teller bij\n    const suppressedCount = context.get('suppressedCount') || {};\n    suppressedCount[dedupeKey] = (suppressedCount[dedupeKey] || 0) + 1;\n    context.set('suppressedCount', suppressedCount);\n    return null;\n}\n\nlastSeen[dedupeKey] = now;\ncontext.set('lastSeen', lastSeen);\n\n// Stap 4: als er eerder onderdrukte meldingen waren, vermeld dat erbij\nconst suppressedCount = context.get('suppressedCount') || {};\nconst suppressedForThis = suppressedCount[dedupeKey] || 0;\nif (suppressedForThis > 0) {\n    msg.payload.suppressedRepeats = suppressedForThis;\n    suppressedCount[dedupeKey] = 0;\n    context.set('suppressedCount', suppressedCount);\n}\n\n// Stap 5: doorlaten als échte, relevante fout\nmsg.topic = 'MODBUS REPEATER ALERT';\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1460,
+        "y": 340,
+        "wires": [
+            [
+                "d9b81d509f6d269e"
+            ]
+        ]
+    },
+    {
+        "id": "d9b81d509f6d269e",
+        "type": "debug",
+        "z": "1076ddf93ad6d62d",
+        "name": "Server Status msg",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1690,
+        "y": 300,
+        "wires": []
+    }
+]
